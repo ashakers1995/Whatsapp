@@ -15,14 +15,28 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
-const DROPBOX_SESSION_PATH = process.env.DROPBOX_SESSION_PATH || '/whatsapp-obsidian/auth_info.zip';
-const DROPBOX_QR_PATH = process.env.DROPBOX_QR_PATH || '/whatsapp-qr.png';
+
+function normalizeDropboxPath(rawPath) {
+  const trimmed = rawPath.trim();
+  const withLeadingSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/{2,}/g, '/').replace(/(.)\/+$/, '$1');
+}
+
+const DROPBOX_SESSION_PATH = normalizeDropboxPath(process.env.DROPBOX_SESSION_PATH || '/whatsapp-obsidian/auth_info.zip');
+const DROPBOX_QR_PATH = normalizeDropboxPath(process.env.DROPBOX_QR_PATH || '/whatsapp-qr.png');
 const TARGET_PHONE_NUMBER = (process.env.TARGET_PHONE_NUMBER || '971564949243').replace(/\D/g, '');
 const TARGET_JID = `${TARGET_PHONE_NUMBER}@s.whatsapp.net`;
 const PIN_EMOJI_REGEX = /\u{1F4CC}/u;
 const PIN_EMOJI_REGEX_GLOBAL = /\u{1F4CC}/gu;
 
 const logger = P({ level: process.env.LOG_LEVEL || 'info' });
+
+function logDropboxError(context, err) {
+  const status = err?.status;
+  const body = err?.error;
+  const serializedBody = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+  console.error(`[dropbox] ${context} failed (status ${status}):`, serializedBody || err?.message || err);
+}
 
 function getDropboxClient() {
   const accessToken = process.env.DROPBOX_ACCESS_TOKEN;
@@ -48,7 +62,7 @@ async function downloadSessionFromDropbox() {
     if (err?.status === 409 || err?.error?.error_summary?.startsWith('path/not_found')) {
       console.log('[dropbox] No existing session found in Dropbox - starting fresh (QR scan required).');
     } else {
-      console.error('[dropbox] Failed to download session, starting fresh:', err?.message || err);
+      logDropboxError('Session download', err);
     }
   }
 }
@@ -69,7 +83,7 @@ async function uploadSessionToDropbox() {
     });
     console.log('[dropbox] Uploaded latest auth_info session to Dropbox.');
   } catch (err) {
-    console.error('[dropbox] Failed to upload session:', err?.message || err);
+    logDropboxError('Session upload', err);
   }
 }
 
@@ -79,6 +93,11 @@ async function uploadQrToDropbox(qr) {
 
   try {
     const buffer = await qrcode.toBuffer(qr, { type: 'png' });
+    if (!buffer || buffer.length === 0) {
+      console.error('[dropbox] Generated QR PNG buffer is empty - skipping upload.');
+      return;
+    }
+
     await dbx.filesUpload({
       path: DROPBOX_QR_PATH,
       contents: buffer,
@@ -86,7 +105,7 @@ async function uploadQrToDropbox(qr) {
     });
     console.log(`[dropbox] QR uploaded to Dropbox at ${DROPBOX_QR_PATH} - open Dropbox app on your phone to scan it.`);
   } catch (err) {
-    console.error('[dropbox] Failed to upload QR code:', err?.message || err);
+    logDropboxError('QR upload', err);
   }
 }
 
