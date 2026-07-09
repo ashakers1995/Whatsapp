@@ -1,0 +1,22 @@
+{
+  "name": "whatsapp-obsidian-pipeline",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Forwards WhatsApp messages tagged with the 📌 emoji to an n8n webhook for Obsidian capture",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "adm-zip": "^0.5.10",
+    "dotenv": "^16.4.5",
+    "dropbox": "^10.34.0",
+    "pino": "^9.3.2",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
