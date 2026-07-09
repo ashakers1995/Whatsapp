@@ -35,6 +35,19 @@ function logDropboxError(context, err) {
   console.error(`[dropbox] ${context} failed (status ${status}):`, serializedBody || err?.message || err);
 }
 
+function serializeForLog(value) {
+  try {
+    return JSON.stringify(value, (key, val) => {
+      if (val instanceof Error) {
+        return { message: val.message, stack: val.stack, ...val };
+      }
+      return val;
+    }, 2);
+  } catch (err) {
+    return `[unserializable update: ${err.message}]`;
+  }
+}
+
 function getDropboxClient() {
   const accessToken = process.env.DROPBOX_ACCESS_TOKEN;
   if (!accessToken) {
@@ -46,19 +59,32 @@ function getDropboxClient() {
 
 async function downloadSessionFromDropbox() {
   const dbx = getDropboxClient();
-  if (!dbx) return;
+  if (!dbx) {
+    console.log('[dropbox] Skipping session restore - no DROPBOX_ACCESS_TOKEN configured.');
+    return;
+  }
+
+  console.log(`[dropbox] Attempting to restore session from ${DROPBOX_SESSION_PATH} ...`);
 
   try {
     const response = await dbx.filesDownload({ path: DROPBOX_SESSION_PATH });
     const buffer = response.result.fileBinary;
+
+    // Clear any stale/partial local session before extracting, so leftover
+    // files from a previous crashed run can't corrupt the restored session.
+    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
     fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+
     const zip = new AdmZip(buffer);
     zip.extractAllTo(AUTH_FOLDER, true);
-    console.log('[dropbox] Restored auth_info session from Dropbox.');
+
+    const extractedFiles = fs.readdirSync(AUTH_FOLDER);
+    console.log(`[dropbox] Session download succeeded. Extracted ${extractedFiles.length} file(s) into ${AUTH_FOLDER}: ${extractedFiles.join(', ') || '(none)'}`);
   } catch (err) {
     if (err?.status === 409 || err?.error?.error_summary?.startsWith('path/not_found')) {
-      console.log('[dropbox] No existing session found in Dropbox - starting fresh (QR scan required).');
+      console.log('[dropbox] Session download found no existing file in Dropbox - starting fresh (QR scan required).');
     } else {
+      console.error('[dropbox] Session download failed with an unexpected error - starting fresh (QR scan required).');
       logDropboxError('Session download', err);
     }
   }
@@ -140,40 +166,82 @@ async function forwardToN8n(payload) {
   }
 }
 
+// Guards against two Baileys sockets running concurrently on the same
+// auth_info (e.g. a duplicate 'close' event firing a second reconnect
+// before the first one has finished tearing down). Only ever cleared once
+// the active socket actually reaches a terminal 'close' state.
+let isSocketActive = false;
+
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
-  const { version } = await fetchLatestBaileysVersion();
+  if (isSocketActive) {
+    console.warn('[whatsapp] connectToWhatsApp() called while a socket is already active - ignoring duplicate call.');
+    return;
+  }
+  isSocketActive = true;
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger,
-    printQRInTerminal: false,
-  });
+  let sock;
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+    const { version } = await fetchLatestBaileysVersion();
 
-  sock.ev.on('creds.update', async () => {
-    await saveCreds();
-    await uploadSessionToDropbox();
-  });
+    sock = makeWASocket({
+      version,
+      auth: state,
+      logger,
+      printQRInTerminal: false,
+    });
+
+    sock.ev.on('creds.update', async () => {
+      try {
+        await saveCreds();
+        await uploadSessionToDropbox();
+      } catch (err) {
+        console.error('[whatsapp] Failed to persist credentials update:', err?.stack || err);
+      }
+    });
+  } catch (err) {
+    isSocketActive = false;
+    console.error('[whatsapp] Failed to initialize WhatsApp socket:', err?.stack || err);
+    throw err;
+  }
+
+  // Guards against Baileys emitting more than one 'close' event for the
+  // same socket instance, which would otherwise trigger multiple parallel
+  // reconnects fighting over the same session.
+  let closedHandled = false;
 
   sock.ev.on('connection.update', (update) => {
+    console.log('[whatsapp] connection.update:', serializeForLog(update));
+
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       console.log('\n=== Scan this QR code with WhatsApp (Linked Devices) ===\n');
       qrcodeTerminal.generate(qr, { small: true });
       console.log('\n==========================================================\n');
-      uploadQrToDropbox(qr);
+      uploadQrToDropbox(qr).catch((err) => {
+        console.error('[dropbox] QR upload threw unexpectedly:', err?.stack || err);
+      });
     }
 
     if (connection === 'close') {
+      if (closedHandled) {
+        console.warn('[whatsapp] Duplicate close event for an already-closed socket - ignoring.');
+        return;
+      }
+      closedHandled = true;
+      isSocketActive = false;
+
       const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const errorMessage = lastDisconnect?.error?.message;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-      console.log(`[whatsapp] Connection closed (status ${statusCode}). Reconnect: ${shouldReconnect}`);
+      console.log(`[whatsapp] Connection closed - statusCode=${statusCode} reason="${errorMessage}" reconnect=${shouldReconnect}`);
 
       if (shouldReconnect) {
-        connectToWhatsApp();
+        connectToWhatsApp().catch((err) => {
+          console.error('[whatsapp] Reconnect attempt failed:', err?.stack || err);
+        });
       } else {
         console.log('[whatsapp] Logged out. Delete the session in Dropbox and redeploy to scan a fresh QR code.');
       }
@@ -217,7 +285,21 @@ async function connectToWhatsApp() {
   return sock;
 }
 
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal] Unhandled promise rejection:', reason instanceof Error ? (reason.stack || reason.message) : reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] Uncaught exception:', err?.stack || err);
+  process.exit(1);
+});
+
 (async () => {
-  await downloadSessionFromDropbox();
-  await connectToWhatsApp();
+  try {
+    await downloadSessionFromDropbox();
+    await connectToWhatsApp();
+  } catch (err) {
+    console.error('[fatal] Failed to start WhatsApp bridge:', err?.stack || err);
+    process.exit(1);
+  }
 })();
