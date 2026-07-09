@@ -1,5 +1,29 @@
 require('dotenv').config();
 
+// ---------------------------------------------------------------------------
+// libsignal (a Baileys dependency) logs raw Signal session objects - including
+// private key / root key / chain key buffers - straight to console.info/warn
+// (see libsignal/src/session_record.js). Redact those specific lines so secret
+// key material never lands in Railway's log stream. Everything else passes
+// through untouched.
+// ---------------------------------------------------------------------------
+const SIGNAL_SECRET_LOG_PREFIXES = [
+  'Closing session:',
+  'Opening session:',
+  'Session already closed',
+  'Removing old closed session:',
+];
+for (const level of ['info', 'warn']) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    if (typeof args[0] === 'string' && SIGNAL_SECRET_LOG_PREFIXES.some((p) => args[0].startsWith(p))) {
+      original(`[signal] ${args[0].replace(/:.*$/, '')} (session details redacted)`);
+      return;
+    }
+    original(...args);
+  };
+}
+
 const path = require('path');
 const fs = require('fs');
 const P = require('pino');
@@ -25,6 +49,7 @@ function normalizeDropboxPath(rawPath) {
 
 const DROPBOX_SESSION_PATH = normalizeDropboxPath(process.env.DROPBOX_SESSION_PATH || '/whatsapp-obsidian/auth_info.zip');
 const DROPBOX_QR_PATH = normalizeDropboxPath(process.env.DROPBOX_QR_PATH || '/whatsapp-qr.png');
+const SESSION_UPLOAD_DEBOUNCE_MS = Number(process.env.SESSION_UPLOAD_DEBOUNCE_MS || 3000);
 
 const logger = P({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -90,7 +115,7 @@ async function downloadSessionFromDropbox() {
   }
 }
 
-async function uploadSessionToDropbox() {
+async function uploadSessionToDropbox(reason = 'manual') {
   const dbx = getDropboxClient();
   if (!dbx) return;
 
@@ -104,9 +129,51 @@ async function uploadSessionToDropbox() {
       contents: buffer,
       mode: { '.tag': 'overwrite' },
     });
-    console.log('[dropbox] Uploaded latest auth_info session to Dropbox.');
+    console.log(`[dropbox] Uploaded auth_info session to Dropbox (${reason}, ${buffer.length} bytes).`);
   } catch (err) {
     logDropboxError('Session upload', err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session upload scheduling.
+//
+// Baileys only fires 'creds.update' at login/pairing/key-rotation moments,
+// but the Signal key store (sessions, prekeys, sender keys) is written via
+// state.keys.set() on virtually EVERY message sent or received. If those
+// writes aren't persisted, a container restart restores a stale snapshot and
+// the phone's messages no longer decrypt ("Invalid PreKey ID" /
+// "No session record"). So every key-store write schedules a debounced
+// upload, and uploads are serialized so two zips never race each other.
+// ---------------------------------------------------------------------------
+let sessionUploadTimer = null;
+let sessionUploadRunning = false;
+let sessionUploadQueued = false;
+
+function scheduleSessionUpload(reason) {
+  if (sessionUploadTimer) clearTimeout(sessionUploadTimer);
+  sessionUploadTimer = setTimeout(() => {
+    sessionUploadTimer = null;
+    runSessionUpload(reason).catch((err) => {
+      console.error('[dropbox] Scheduled session upload threw unexpectedly:', err?.stack || err);
+    });
+  }, SESSION_UPLOAD_DEBOUNCE_MS);
+}
+
+async function runSessionUpload(reason) {
+  if (sessionUploadRunning) {
+    sessionUploadQueued = true;
+    return;
+  }
+  sessionUploadRunning = true;
+  try {
+    await uploadSessionToDropbox(reason);
+  } finally {
+    sessionUploadRunning = false;
+    if (sessionUploadQueued) {
+      sessionUploadQueued = false;
+      scheduleSessionUpload('follow-up after concurrent write');
+    }
   }
 }
 
@@ -132,15 +199,36 @@ async function uploadQrToDropbox(qr) {
   }
 }
 
-function extractText(message) {
-  if (!message) return null;
+// Unwrap container message types (disappearing messages, view-once, document
+// captions) so a self-note still extracts even when WhatsApp nests it.
+function unwrapMessage(message) {
   return (
-    message.conversation ||
-    message.extendedTextMessage?.text ||
-    message.imageMessage?.caption ||
-    message.videoMessage?.caption ||
+    message?.ephemeralMessage?.message ||
+    message?.viewOnceMessage?.message ||
+    message?.viewOnceMessageV2?.message ||
+    message?.documentWithCaptionMessage?.message ||
+    message ||
     null
   );
+}
+
+function extractText(message) {
+  const m = unwrapMessage(message);
+  if (!m) return null;
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    null
+  );
+}
+
+function toMillis(messageTimestamp) {
+  const raw = messageTimestamp;
+  const seconds = typeof raw === 'number' ? raw : Number(raw?.toNumber ? raw.toNumber() : raw);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : Date.now();
 }
 
 async function forwardToN8n(payload) {
@@ -166,6 +254,32 @@ async function forwardToN8n(payload) {
   }
 }
 
+// Your account has two identities: the phone JID (971...@s.whatsapp.net) and
+// the anonymized LID (...@lid). Self-chat messages can arrive under EITHER,
+// so match against both or notes silently get dropped.
+function getSelfJids(sock) {
+  const jids = new Set();
+  if (sock.user?.id) jids.add(jidNormalizedUser(sock.user.id));
+  if (sock.user?.lid) jids.add(jidNormalizedUser(sock.user.lid));
+  jids.delete('');
+  return jids;
+}
+
+// Baileys can deliver the same message more than once (retries, receipts);
+// remember recent IDs so a note is never forwarded to n8n twice.
+const forwardedMessageIds = new Set();
+const FORWARDED_IDS_MAX = 500;
+
+function alreadyForwarded(messageId) {
+  if (!messageId) return false;
+  if (forwardedMessageIds.has(messageId)) return true;
+  forwardedMessageIds.add(messageId);
+  if (forwardedMessageIds.size > FORWARDED_IDS_MAX) {
+    forwardedMessageIds.delete(forwardedMessageIds.values().next().value);
+  }
+  return false;
+}
+
 // Guards against two Baileys sockets running concurrently on the same
 // auth_info (e.g. a duplicate 'close' event firing a second reconnect
 // before the first one has finished tearing down). Only ever cleared once
@@ -182,6 +296,16 @@ async function connectToWhatsApp() {
   let sock;
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+
+    // Persist Signal key-store writes too, not just creds.json - see the
+    // session upload scheduling comment above. Must wrap BEFORE the socket
+    // is created so Baileys uses the wrapped setter.
+    const originalKeysSet = state.keys.set.bind(state.keys);
+    state.keys.set = async (data) => {
+      await originalKeysSet(data);
+      scheduleSessionUpload('signal key-store write');
+    };
+
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
@@ -194,7 +318,7 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', async () => {
       try {
         await saveCreds();
-        await uploadSessionToDropbox();
+        scheduleSessionUpload('creds update');
       } catch (err) {
         console.error('[whatsapp] Failed to persist credentials update:', err?.stack || err);
       }
@@ -246,21 +370,24 @@ async function connectToWhatsApp() {
         console.log('[whatsapp] Logged out. Delete the session in Dropbox and redeploy to scan a fresh QR code.');
       }
     } else if (connection === 'open') {
-      console.log('[whatsapp] Connected.');
+      const selfJids = [...getSelfJids(sock)].join(', ');
+      console.log(`[whatsapp] Connected. Watching self-chat for JIDs: ${selfJids || '(unknown yet)'}`);
     }
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
-    const selfJid = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
+    const selfJids = getSelfJids(sock);
 
     for (const msg of messages) {
       try {
         if (!msg.message) continue;
 
-        // "Message Yourself": WhatsApp routes it to your own JID with fromMe true.
-        const isSelfChat = !!selfJid && msg.key.fromMe && msg.key.remoteJid === selfJid;
+        // "Message Yourself": fromMe with the chat JID being one of your own
+        // identities (phone JID or LID).
+        const chatJid = jidNormalizedUser(msg.key.remoteJid || '');
+        const isSelfChat = msg.key.fromMe && selfJids.has(chatJid);
         if (!isSelfChat) continue;
 
         const text = extractText(msg.message);
@@ -269,12 +396,17 @@ async function connectToWhatsApp() {
         const cleanText = text.trim();
         if (!cleanText) continue;
 
+        if (alreadyForwarded(msg.key.id)) {
+          console.log(`[whatsapp] Skipping duplicate delivery of message ${msg.key.id}`);
+          continue;
+        }
+
         console.log(`📥 Captured self-note: ${cleanText}`);
 
         await forwardToN8n({
           from: msg.key.remoteJid,
           text: cleanText,
-          timestamp: Number(msg.messageTimestamp) * 1000,
+          timestamp: toMillis(msg.messageTimestamp),
         });
       } catch (err) {
         console.error('[whatsapp] Error handling message:', err?.message || err);
@@ -284,6 +416,29 @@ async function connectToWhatsApp() {
 
   return sock;
 }
+
+// Railway sends SIGTERM on redeploy/stop. Flush the latest session to Dropbox
+// before exiting so the next container restores up-to-date Signal keys and
+// incoming messages keep decrypting.
+let shuttingDown = false;
+async function flushSessionAndExit(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] Received ${signal} - flushing session to Dropbox before exit...`);
+  if (sessionUploadTimer) {
+    clearTimeout(sessionUploadTimer);
+    sessionUploadTimer = null;
+  }
+  try {
+    await uploadSessionToDropbox(`shutdown flush (${signal})`);
+  } catch (err) {
+    console.error('[shutdown] Final session upload failed:', err?.stack || err);
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => { flushSessionAndExit('SIGTERM'); });
+process.on('SIGINT', () => { flushSessionAndExit('SIGINT'); });
 
 process.on('unhandledRejection', (reason) => {
   console.error('[fatal] Unhandled promise rejection:', reason instanceof Error ? (reason.stack || reason.message) : reason);

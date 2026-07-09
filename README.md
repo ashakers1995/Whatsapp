@@ -13,10 +13,12 @@ WhatsApp account as a linked device.
 
 1. The script connects to WhatsApp as a linked device (like WhatsApp Web).
 2. It watches for messages in your **"Message Yourself"** chat — detected by
-   comparing `msg.key.remoteJid` against your own normalized JID (via
-   Baileys' `jidNormalizedUser(sock.user.id)`), combined with
+   comparing `msg.key.remoteJid` against **both** of your account's
+   identities: the phone JID (`971...@s.whatsapp.net`) and the anonymized
+   LID (`...@lid`) that newer WhatsApp versions use, combined with
    `msg.key.fromMe`. This only matches the self-chat, so outgoing messages
-   in any other chat are left alone.
+   in any other chat are left alone. Duplicate deliveries of the same
+   message ID are filtered so a note is never forwarded twice.
 3. Every text message sent in that chat is forwarded as-is to your n8n
    webhook — no marker or trigger emoji required:
    ```json
@@ -36,6 +38,7 @@ In your Railway project, go to the service → **Variables** tab, and add:
 | `DROPBOX_ACCESS_TOKEN` | Dropbox API access token used to persist the WhatsApp session |
 | `DROPBOX_SESSION_PATH` | *(optional)* Dropbox path for the session zip, defaults to `/whatsapp-obsidian/auth_info.zip` |
 | `DROPBOX_QR_PATH` | *(optional)* Dropbox path for the QR code PNG, defaults to `/whatsapp-qr.png` |
+| `SESSION_UPLOAD_DEBOUNCE_MS` | *(optional)* Delay after the last key write before re-uploading the session, defaults to `3000` |
 | `LOG_LEVEL` | *(optional)* Baileys log verbosity, defaults to `info` |
 
 See `.env.example` for the full list with placeholder values. **Never commit
@@ -86,18 +89,30 @@ container, which would normally mean re-scanning the QR code every time.
 To avoid that:
 
 - **On startup**, the script downloads `auth_info.zip` from Dropbox (path
-  set by `DROPBOX_SESSION_PATH`) and extracts it into the local `auth_info/`
-  folder *before* connecting to WhatsApp. If nothing exists yet in Dropbox
-  (first run), it just starts fresh and a QR scan is required.
-- **On every `creds.update` event** (Baileys fires this whenever the auth
-  state changes, e.g. after linking or periodic key rotation), the script
-  re-zips the local `auth_info/` folder and overwrites the copy in Dropbox.
+  set by `DROPBOX_SESSION_PATH`), fully clears the local `auth_info/`
+  folder, and extracts the archive into it *before* connecting to WhatsApp.
+  If nothing exists yet in Dropbox (first run), it just starts fresh and a
+  QR scan is required.
+- **On every auth-state write** — not just `creds.update`. Baileys only
+  fires `creds.update` at login/pairing moments, but the Signal key store
+  (sessions, prekeys) is written on virtually every message. Both paths now
+  schedule a debounced re-upload (default 3 s after the last write, tunable
+  via `SESSION_UPLOAD_DEBOUNCE_MS`), so the Dropbox copy always contains
+  current encryption keys. Without this, a redeploy restores stale keys and
+  incoming messages fail to decrypt with `Invalid PreKey ID` /
+  `No session record` errors.
+- **On shutdown** (SIGTERM/SIGINT, e.g. a Railway redeploy), a final flush
+  uploads the latest session before the container exits.
 - This means the session survives redeploys, and you only need to scan the
   QR code once — unless you explicitly log out from your phone (WhatsApp →
   Linked Devices → remove this device), in which case Baileys reports a
   `loggedOut` disconnect reason, the script stops auto-reconnecting, and
   you'll need to delete the stale session from Dropbox and redeploy to scan
   a fresh QR.
+
+Note: the `libsignal` library used by Baileys logs raw session objects
+(including private keys) to the console. The script redacts those specific
+log lines so secret key material never appears in Railway's logs.
 
 ## d) The self-chat capture convention
 
