@@ -37,7 +37,7 @@ const {
   fetchLatestBaileysVersion,
   DisconnectReason,
   jidNormalizedUser,
-} = require('@whiskeysockets/baileys');
+} = require('baileys');
 
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
 

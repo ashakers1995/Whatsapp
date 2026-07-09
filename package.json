@@ -6,14 +6,14 @@
   "main": "index.js",
   "type": "commonjs",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
     "adm-zip": "^0.5.10",
+    "baileys": "7.0.0-rc13",
     "dotenv": "^16.4.5",
     "dropbox": "^10.34.0",
     "pino": "^9.3.2",
