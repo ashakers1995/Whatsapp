@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const P = require('pino');
 const qrcodeTerminal = require('qrcode-terminal');
+const qrcode = require('qrcode');
 const AdmZip = require('adm-zip');
 const { Dropbox } = require('dropbox');
 const {
@@ -15,6 +16,7 @@ const {
 
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
 const DROPBOX_SESSION_PATH = process.env.DROPBOX_SESSION_PATH || '/whatsapp-obsidian/auth_info.zip';
+const DROPBOX_QR_PATH = process.env.DROPBOX_QR_PATH || '/whatsapp-qr.png';
 const TARGET_PHONE_NUMBER = (process.env.TARGET_PHONE_NUMBER || '971564949243').replace(/\D/g, '');
 const TARGET_JID = `${TARGET_PHONE_NUMBER}@s.whatsapp.net`;
 const PIN_EMOJI_REGEX = /\u{1F4CC}/u;
@@ -68,6 +70,23 @@ async function uploadSessionToDropbox() {
     console.log('[dropbox] Uploaded latest auth_info session to Dropbox.');
   } catch (err) {
     console.error('[dropbox] Failed to upload session:', err?.message || err);
+  }
+}
+
+async function uploadQrToDropbox(qr) {
+  const dbx = getDropboxClient();
+  if (!dbx) return;
+
+  try {
+    const buffer = await qrcode.toBuffer(qr, { type: 'png' });
+    await dbx.filesUpload({
+      path: DROPBOX_QR_PATH,
+      contents: buffer,
+      mode: { '.tag': 'overwrite' },
+    });
+    console.log(`[dropbox] QR uploaded to Dropbox at ${DROPBOX_QR_PATH} - open Dropbox app on your phone to scan it.`);
+  } catch (err) {
+    console.error('[dropbox] Failed to upload QR code:', err?.message || err);
   }
 }
 
@@ -128,6 +147,7 @@ async function connectToWhatsApp() {
       console.log('\n=== Scan this QR code with WhatsApp (Linked Devices) ===\n');
       qrcodeTerminal.generate(qr, { small: true });
       console.log('\n==========================================================\n');
+      uploadQrToDropbox(qr);
     }
 
     if (connection === 'close') {

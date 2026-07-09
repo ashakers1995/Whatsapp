@@ -35,6 +35,7 @@ In your Railway project, go to the service → **Variables** tab, and add:
 | `DROPBOX_ACCESS_TOKEN` | Dropbox API access token used to persist the WhatsApp session |
 | `TARGET_PHONE_NUMBER` | *(optional)* Digits-only phone number to watch, defaults to `971564949243` |
 | `DROPBOX_SESSION_PATH` | *(optional)* Dropbox path for the session zip, defaults to `/whatsapp-obsidian/auth_info.zip` |
+| `DROPBOX_QR_PATH` | *(optional)* Dropbox path for the QR code PNG, defaults to `/whatsapp-qr.png` |
 | `LOG_LEVEL` | *(optional)* Baileys log verbosity, defaults to `info` |
 
 See `.env.example` for the full list with placeholder values. **Never commit
@@ -58,8 +59,18 @@ HTTP port is opened — that's expected).
    ```
    === Scan this QR code with WhatsApp (Linked Devices) ===
    ```
+   Railway's web-based log viewer can wrap/garble this ASCII QR code and
+   make it unscannable, so as a more reliable alternative the script also
+   generates the QR as a PNG and uploads it to Dropbox at `DROPBOX_QR_PATH`
+   (default `/whatsapp-qr.png`, overwritten on every QR event). Watch for
+   this log line:
+   ```
+   [dropbox] QR uploaded to Dropbox at /whatsapp-qr.png - open Dropbox app on your phone to scan it.
+   ```
+   Then open `/whatsapp-qr.png` in the Dropbox app/website on your phone
+   and scan it like a normal image.
 4. On your phone: WhatsApp → **Settings → Linked Devices → Link a Device**,
-   then scan the QR code shown in the Railway logs.
+   then scan the QR code (from the Railway logs or the Dropbox PNG).
 5. Once linked, the log will show `[whatsapp] Connected.` and the session
    will be zipped and uploaded to Dropbox automatically — you should not
    need to scan again on future redeploys.
