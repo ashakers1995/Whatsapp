@@ -12,6 +12,7 @@ const {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
+  jidNormalizedUser,
 } = require('@whiskeysockets/baileys');
 
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
@@ -24,10 +25,6 @@ function normalizeDropboxPath(rawPath) {
 
 const DROPBOX_SESSION_PATH = normalizeDropboxPath(process.env.DROPBOX_SESSION_PATH || '/whatsapp-obsidian/auth_info.zip');
 const DROPBOX_QR_PATH = normalizeDropboxPath(process.env.DROPBOX_QR_PATH || '/whatsapp-qr.png');
-const TARGET_PHONE_NUMBER = (process.env.TARGET_PHONE_NUMBER || '971564949243').replace(/\D/g, '');
-const TARGET_JID = `${TARGET_PHONE_NUMBER}@s.whatsapp.net`;
-const PIN_EMOJI_REGEX = /\u{1F4CC}/u;
-const PIN_EMOJI_REGEX_GLOBAL = /\u{1F4CC}/gu;
 
 const logger = P({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -136,7 +133,7 @@ async function forwardToN8n(payload) {
     if (!res.ok) {
       console.error(`[n8n] Webhook returned ${res.status}:`, await res.text());
     } else {
-      console.log('[n8n] Forwarded pinned message:', payload.text);
+      console.log('[n8n] Forwarded message:', payload.text);
     }
   } catch (err) {
     console.error('[n8n] Failed to reach webhook:', err?.message || err);
@@ -188,17 +185,23 @@ async function connectToWhatsApp() {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
+    const selfJid = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
+
     for (const msg of messages) {
       try {
         if (!msg.message) continue;
-        if (msg.key.remoteJid !== TARGET_JID) continue;
-        if (!msg.key.fromMe) continue;
+
+        // "Message Yourself": WhatsApp routes it to your own JID with fromMe true.
+        const isSelfChat = !!selfJid && msg.key.fromMe && msg.key.remoteJid === selfJid;
+        if (!isSelfChat) continue;
 
         const text = extractText(msg.message);
-        if (!text || !PIN_EMOJI_REGEX.test(text)) continue;
+        if (!text) continue;
 
-        const cleanText = text.replace(PIN_EMOJI_REGEX_GLOBAL, '').trim();
+        const cleanText = text.trim();
         if (!cleanText) continue;
+
+        console.log(`📥 Captured self-note: ${cleanText}`);
 
         await forwardToN8n({
           from: msg.key.remoteJid,

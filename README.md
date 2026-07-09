@@ -1,7 +1,8 @@
 # WhatsApp → Obsidian Pipeline
 
-Captures WhatsApp messages you send to a specific number and forwards them to
-an n8n webhook, which writes them into your Obsidian vault (via Dropbox sync).
+Captures every WhatsApp message you send to yourself (the "Message Yourself"
+chat) and forwards it to an n8n webhook, which writes it into your Obsidian
+vault (via Dropbox sync).
 
 Connects to WhatsApp using [Baileys](https://github.com/WhiskeySockets/Baileys)
 (QR-linked device method), **not** the official Meta Business API — this
@@ -11,17 +12,17 @@ WhatsApp account as a linked device.
 ## How it works
 
 1. The script connects to WhatsApp as a linked device (like WhatsApp Web).
-2. It watches for messages **you send** to `TARGET_PHONE_NUMBER` (default
-   `+971564949243`).
-3. If the message text contains a 📌 emoji, the emoji is stripped and the
-   remaining text is POSTed to your n8n webhook as:
+2. It watches for messages in your **"Message Yourself"** chat — detected by
+   comparing `msg.key.remoteJid` against your own normalized JID (via
+   Baileys' `jidNormalizedUser(sock.user.id)`), combined with
+   `msg.key.fromMe`. This only matches the self-chat, so outgoing messages
+   in any other chat are left alone.
+3. Every text message sent in that chat is forwarded as-is to your n8n
+   webhook — no marker or trigger emoji required:
    ```json
    { "from": "971564949243@s.whatsapp.net", "text": "your note text", "timestamp": 1737000000000 }
    ```
-4. Messages without 📌 are ignored — this is your "capture to Obsidian"
-   trigger convention. Send yourself a normal message to that number and
-   nothing happens; prefix/include 📌 and it gets captured.
-5. The n8n workflow (built separately, not part of this repo) receives the
+4. The n8n workflow (built separately, not part of this repo) receives the
    webhook and writes a note into your Obsidian vault folder, which Dropbox
    syncs to your devices.
 
@@ -33,7 +34,6 @@ In your Railway project, go to the service → **Variables** tab, and add:
 |---|---|
 | `N8N_WEBHOOK_URL` | Your n8n webhook URL that receives the captured note |
 | `DROPBOX_ACCESS_TOKEN` | Dropbox API access token used to persist the WhatsApp session |
-| `TARGET_PHONE_NUMBER` | *(optional)* Digits-only phone number to watch, defaults to `971564949243` |
 | `DROPBOX_SESSION_PATH` | *(optional)* Dropbox path for the session zip, defaults to `/whatsapp-obsidian/auth_info.zip` |
 | `DROPBOX_QR_PATH` | *(optional)* Dropbox path for the QR code PNG, defaults to `/whatsapp-qr.png` |
 | `LOG_LEVEL` | *(optional)* Baileys log verbosity, defaults to `info` |
@@ -99,18 +99,18 @@ To avoid that:
   you'll need to delete the stale session from Dropbox and redeploy to scan
   a fresh QR.
 
-## d) The 📌 trigger convention
+## d) The self-chat capture convention
 
-Only messages **you send** to `TARGET_PHONE_NUMBER` that contain a 📌 emoji
-are captured. This keeps the pipeline opt-in per message: use that chat as a
-scratchpad and prefix anything you want saved to Obsidian with 📌, e.g.:
+There's no marker or trigger emoji — every message you send in WhatsApp's
+"Message Yourself" chat is captured and forwarded. Use that chat as your
+Obsidian scratchpad:
 
 ```
-📌 Idea: try batching the Dropbox uploads instead of on every creds update
+Idea: try batching the Dropbox uploads instead of on every creds update
 ```
 
-The 📌 is stripped before the text is sent to n8n, so your Obsidian note
-just contains the clean message text.
+The script logs `📥 Captured self-note: <text>` in the console whenever a
+message is captured, so you can confirm it fired.
 
 ## Reconnection behavior
 
